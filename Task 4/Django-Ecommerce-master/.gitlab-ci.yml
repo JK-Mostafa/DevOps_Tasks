@@ -1,0 +1,130 @@
+image: python:3.7
+
+stages:
+  - build
+  - test
+  - scan
+  - deploy
+  - build_image
+  - scan_image
+  - push_image
+
+variables:
+  CONTAINER_IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+cache:
+  paths:
+    - .cache/pip/
+
+# 1: Build the application
+build_app:
+  stage: build
+  script:
+    - python -m pip install --upgrade pip
+    - pip install -r requirements.txt
+    - python manage.py build
+  artifacts:
+    paths:
+      - build/
+    expire_in: 1 day
+
+# 2: Run unit tests
+unit_tests:
+  stage: test
+  script:
+    - pip install -r requirements.txt
+    - python -m pip install pytest
+    - python -m pytest
+
+# 3: Scan the application for vulnerabilities
+security_scan:
+  stage: scan
+  script:
+    - pip install pip-audit
+    - pip-audit -r requirements.txt
+
+# 4: Deploy to staging
+deploy_app:
+  stage: deploy
+  image: alpine
+  needs:
+    - job: build_app
+      artifacts: true
+    - job: unit_tests
+    - job: security_scan
+  before_script:
+    - test -n "$SSH_PRIVATE_KEY"
+    - test -n "$STAGING_KNOWN_HOSTS"
+    - test -n "$STAGING_HOST"
+    - test -n "$STAGING_USER"
+    - test -n "$STAGING_DEPLOY_PATH"
+    - apk add --no-cache openssh-client rsync
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+    - chmod 600 ~/.ssh/id_ed25519
+    - printf '%s\n' "$STAGING_KNOWN_HOSTS" > ~/.ssh/known_hosts
+    - chmod 600 ~/.ssh/known_hosts
+  script:
+    # Package the downloaded artifact
+    - tar -czf build.tar.gz -C build .
+    # Copy the artifact archive to the server
+    - scp -i ~/.ssh/id_ed25519 -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes build.tar.gz "$STAGING_USER@$STAGING_HOST:/tmp/build-$CI_COMMIT_SHORT_SHA.tar.gz"
+    # Extract the artifact into the deployment directory
+    - ssh -i ~/.ssh/id_ed25519 -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes "$STAGING_USER@$STAGING_HOST" "mkdir -p '$STAGING_DEPLOY_PATH' && tar -xzf '/tmp/build-$CI_COMMIT_SHORT_SHA.tar.gz' -C '$STAGING_DEPLOY_PATH' && rm '/tmp/build-$CI_COMMIT_SHORT_SHA.tar.gz'"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+
+# 5: Build the image, but do not push it
+docker_build:
+  stage: build_image
+  image: docker
+  services:
+    - name: docker:27.5.1-dind
+  needs:
+    - job: build_app
+      artifacts: false
+    - job: unit_tests
+      artifacts: false
+    - job: security_scan
+      artifacts: false
+  before_script:
+    - docker info
+  script:
+    - docker build -t "$CONTAINER_IMAGE" .
+    - docker save "$CONTAINER_IMAGE" -o image.tar
+  artifacts:
+    paths:
+      - image.tar
+    expire_in: 1 day
+
+# 6: Scan the image
+image_scan:
+  stage: scan_image
+  image:
+    name: aquasec/trivy:0.69.0
+    entrypoint: [""]
+  needs:
+    - job: docker_build
+      artifacts: true
+  script:
+    - trivy image --input image.tar --severity HIGH,CRITICAL --exit-code 1 --no-progress
+
+# 7: Push only if the image scan succeeds
+docker_push:
+  stage: push_image
+  image: docker:27.5.1-cli
+  services:
+    - name: docker:27.5.1-dind
+      alias: docker
+  needs:
+    - job: docker_build
+      artifacts: true
+    - job: image_scan
+      artifacts: false
+  script:
+    - docker login -u gitlab-ci-token -p $CI_JOB_TOKEN $CI_REGISTRY
+    - docker load -i image.tar
+    - docker push "$CONTAINER_IMAGE"

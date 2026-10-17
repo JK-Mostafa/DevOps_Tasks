@@ -93,6 +93,7 @@ def check_email(email):
 
 def main():
     init_logs(log_file)
+    logging.info(f"Script started...")
     check_arg()
     process_file(file_path)
 

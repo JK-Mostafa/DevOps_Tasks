@@ -56,6 +56,14 @@ On all VMs we need to run the below configuration.
    EOF
    ```
 
+2. Restrict access to API server:
+   Will use UbuntuFireWall (ufw) to restrict access to API server on port 6443/tcp:
+   ```shell
+   # Allow only Workers and my PC
+   sudo ufw allow from 192.168.8.201 to any port 6443 prototcp
+   sudo ufw allow from 192.168.8.10 to any port 6443 prototcp
+   ```
+
 ## 2. Package Installation
 
 ### 2.1 Install `containerd`:
